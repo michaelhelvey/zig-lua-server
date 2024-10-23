@@ -1,0 +1,104 @@
+// Lua utils lib that we expose to our scripts
+const std = @import("std");
+const lua = @import("lua.zig");
+
+fn cStrAsSlice(cstr: [*c]const u8) []const u8 {
+    const len = std.mem.len(cstr);
+    return cstr[0..len];
+}
+
+fn encodeJsonValue(L: ?*lua.LuaState, writer: anytype) anyerror!void {
+    const typ = lua.lua_type(L, -1);
+    switch (typ) {
+        .TABLE => {
+            lua.lua_pushnil(L); // table is at -1
+            if (lua.lua_next(L, -2) != 0) { // table at -2, nil at -1
+                if (lua.lua_isnumber(L, -2)) { // table at -3, key at -2, value at -1
+                    try writer.beginArray();
+
+                    // then encode the the value
+                    try encodeJsonValue(L, writer);
+                    // pop the value
+                    lua.lua_pop(L, 1);
+
+                    // then keep encoding and popping until we're done
+                    while (lua.lua_next(L, -2) != 0) {
+                        try encodeJsonValue(L, writer);
+                        lua.lua_pop(L, 1);
+                    }
+
+                    // finally end the array
+                    try writer.endArray();
+                } else {
+                    try writer.beginObject();
+
+                    // encode the key/value we ar ecurrently at
+                    try writer.objectField(cStrAsSlice(lua.lua_tostring(L, -2)));
+                    try encodeJsonValue(L, writer);
+                    lua.lua_pop(L, 1);
+
+                    // keep encoding and popping
+                    while (lua.lua_next(L, -2) != 0) {
+                        const key = cStrAsSlice(lua.lua_tostring(L, -2));
+                        try writer.objectField(key);
+                        try encodeJsonValue(L, writer);
+                        lua.lua_pop(L, 1);
+                    }
+
+                    // then end the object
+                    try writer.endObject();
+                }
+            } else {
+                try writer.beginObject();
+                try writer.endObject();
+            }
+        },
+        .STRING => {
+            const key = cStrAsSlice(lua.lua_tostring(L, -1));
+            try writer.write(key);
+        },
+        .NUMBER => {
+            try writer.write(lua.lua_tonumber(L, -1));
+        },
+        .BOOLEAN => {
+            try writer.write(lua.lua_toboolean(L, -1));
+        },
+        else => {
+            std.log.err("TODO: handle type {any}", .{typ});
+            return error.UnparsableJsonType;
+        },
+    }
+}
+
+fn encodeJsonInner(L: ?*lua.LuaState) !c_int {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+
+    var outStream = std.ArrayList(u8).init(alloc);
+    var jsonWriter = std.json.writeStream(outStream.writer(), .{});
+    try encodeJsonValue(L, &jsonWriter);
+    // pop the argument when we are done with it
+    lua.lua_pop(L, 1);
+
+    // then push the return value
+    lua.lua_pushlstring(L, @ptrCast(outStream.items.ptr), outStream.items.len);
+    return 1;
+}
+
+fn encodeLuaTableAsJson(L: ?*lua.LuaState) c_int {
+    return encodeJsonInner(L) catch |err| {
+        std.log.err("internal (not lua) error encoding json: {any}", .{err});
+        lua.show_lua_error(L, "could not encode json", .{});
+        return 0;
+    };
+}
+
+const module: [2]lua.LuaReg = .{ lua.LuaReg{ .name = "json", .func = encodeLuaTableAsJson }, lua.LuaReg{ .name = null, .func = null } };
+
+pub fn initTable(L: ?*lua.LuaState) void {
+    lua.lua_newtable(L);
+    lua.luaL_setfuncs(L, &module, 0);
+    lua.lua_setglobal(L, "utils");
+}

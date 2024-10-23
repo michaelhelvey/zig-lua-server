@@ -78,6 +78,8 @@ pub extern fn lua_error(L: ?*LuaState) c_int;
 pub extern fn luaL_error(L: ?*LuaState, fmt: [*c]const u8, ...) c_int;
 pub extern fn luaL_setfuncs(L: ?*LuaState, l: [*c]const LuaReg, nup: c_int) void;
 pub extern fn luaL_checkversion_(L: ?*LuaState, ver: LuaNumber, sz: usize) void;
+pub extern fn lua_next(L: ?*LuaState, idx: c_int) c_int;
+pub extern fn lua_setglobal(L: ?*LuaState, name: [*c]const u8) void;
 
 pub extern fn lua_pushboolean(L: ?*LuaState, value: bool) void;
 pub extern fn lua_pushcclosure(L: ?*LuaState, func: CFunction, n: c_int) void;
@@ -248,26 +250,49 @@ pub fn lua_debug_stack(L: ?*LuaState) void {
             },
             Type.BOOLEAN => {
                 const value = lua_toboolean(L, i);
-                std.debug.print("{d}", .{value});
+                std.debug.print("{?}", .{value});
             },
             Type.LIGHTUSERDATA => {
                 const value = lua_touserdata(L, i);
-                std.debug.print("{p}", .{value});
+                std.debug.print("{*}", .{value});
             },
             Type.NUMBER => {
                 const value = lua_tonumber(L, i);
-                std.debug.print("{f}", .{value});
+                std.debug.print("{?}", .{value});
             },
             Type.STRING => {
                 const value = lua_tostring(L, i);
                 std.debug.print("{s}", .{value});
             },
+            Type.USERDATA => {
+                const value = lua_topointer(L, i);
+                std.debug.print("{*}", .{value});
+            },
             else => {
                 // TODO: look into how to print tables & functions and stuff
-                std.debug.print("unprintable type {any}", .{typ});
+                std.debug.print("unprintable type", .{});
             },
         }
 
         std.debug.print(")\n", .{});
     }
+}
+
+pub inline fn get_top_typename(L: ?*LuaState) [*c]const u8 {
+    const typ = lua_type(L, -1);
+    const typename = lua_typename(L, @intFromEnum(typ));
+
+    return typename;
+}
+
+pub inline fn show_lua_error(L: ?*LuaState, fmt: [*c]const u8, args: anytype) void {
+    _ = @call(std.builtin.CallModifier.auto, luaL_error, .{ L, fmt } ++ args);
+}
+
+pub fn cStrToOwned(cstr: [*c]const u8, allocator: std.mem.Allocator) ![]const u8 {
+    const bodyLen = std.mem.len(cstr);
+    const luaBody: []const u8 = cstr[0..bodyLen];
+    const ownedBody = try allocator.alloc(u8, bodyLen);
+    @memcpy(ownedBody, luaBody);
+    return @ptrCast(ownedBody);
 }
