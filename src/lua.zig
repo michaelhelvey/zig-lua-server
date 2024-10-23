@@ -5,6 +5,10 @@
 // /opt/homebrew/include/lua/lua.h
 // /opt/homebrew/include/lua/lauxlib.h
 const std = @import("std");
+const c = @cImport({
+    @cInclude("strings.h");
+});
+const expect = std.testing.expect;
 
 pub const LuaState = opaque {};
 const KContext = usize;
@@ -49,6 +53,9 @@ const Type = enum(c_int) {
     USERDATA = 7,
     THREAD = 8,
     NUMTYPES = 9,
+    // "pseudo-types" that don't really exist on the lua stack, but I find convenient for casting
+    INTEGER = 90,
+    FLOAT = 91,
 };
 
 pub const MULTRET = -1;
@@ -114,6 +121,11 @@ pub extern fn lua_rawgeti(L: ?*LuaState, idx: c_int, n: c_int) Type;
 //--------------------------------------------------------------------------------------------------
 // C macro translations, in no particular order at all
 //--------------------------------------------------------------------------------------------------
+
+pub inline fn lua_register(L: ?*LuaState, n: [*c]const u8, f: CFunction) void {
+    lua_pushcfunction(L, f);
+    lua_setglobal(L, n);
+}
 
 pub inline fn lua_pushglobaltable(L: ?*LuaState) void {
     _ = lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);
@@ -235,71 +247,322 @@ pub inline fn lua_newtable(L: ?*LuaState) void {
     return lua_createtable(L, 0, 0);
 }
 
-pub fn lua_debug_stack(L: ?*LuaState) void {
-    const top = lua_gettop(L);
+//--------------------------------------------------------------------------------------------------
+// Public "zig-friendly" API
+//
+// Note that I have 0 intention of fully replicating the entire lua library (either here or in the
+// above bindings), I just tack things on when I use them and make up APIs as I go along :D
+//--------------------------------------------------------------------------------------------------
 
-    std.debug.print("-- LUA STACK (top = {d}) --\n", .{top});
-    var i: c_int = 0;
-    while (i <= top) : (i += 1) {
-        const typ = lua_type(L, i);
-        std.debug.print("\t{d}: {s} (", .{ i, @tagName(typ) });
-        switch (typ) {
-            Type.NONE => {
-                std.debug.print("none", .{});
+pub const Lua = struct {
+    state: ?*LuaState,
+
+    const Self = @This();
+
+    pub fn init() Self {
+        const L = luaL_newstate();
+        luaL_openlibs(L);
+
+        return Self{ .state = L };
+    }
+
+    pub fn execBuffer(self: *Lua, buffer: []const u8, name: [*c]const u8) !void {
+        if (luaL_loadbufferx(self.state, @ptrCast(buffer.ptr), buffer.len, name, null) != Status.OK) {
+            const err = lua_tostring(self.state, -1);
+            std.log.err("loadBuffer error: {s}", .{err});
+            lua_pop(self.state, 1);
+            return error.Loadbuffer;
+        }
+
+        try lua_pcall(self.state, 0, MULTRET, 0);
+        self.clearStack();
+    }
+
+    pub fn clearStack(self: *Lua) void {
+        lua_pop(self.state, lua_gettop(self.state));
+    }
+
+    pub fn execFile(self: *Lua, file: []const u8) !void {
+        luaL_dofile(self.state, file);
+    }
+
+    pub fn openTable(self: *Lua) void {
+        lua_newtable(self.state);
+    }
+
+    pub fn pushTablePair(self: *Lua, key: anytype, value: anytype) !void {
+        const T = @TypeOf(key);
+        switch (@typeInfo(T)) {
+            .Int, .ComptimeInt => {
+                lua_pushinteger(self.state, key);
             },
-            Type.NIL => {
-                std.debug.print("nil", .{});
-            },
-            Type.BOOLEAN => {
-                const value = lua_toboolean(L, i);
-                std.debug.print("{?}", .{value});
-            },
-            Type.LIGHTUSERDATA => {
-                const value = lua_touserdata(L, i);
-                std.debug.print("{*}", .{value});
-            },
-            Type.NUMBER => {
-                const value = lua_tonumber(L, i);
-                std.debug.print("{?}", .{value});
-            },
-            Type.STRING => {
-                const value = lua_tostring(L, i);
-                std.debug.print("{s}", .{value});
-            },
-            Type.USERDATA => {
-                const value = lua_topointer(L, i);
-                std.debug.print("{*}", .{value});
-            },
+            .Pointer => try self.pushPointer(key),
             else => {
-                // TODO: look into how to print tables & functions and stuff
-                std.debug.print("unprintable type", .{});
+                std.log.err("invalid lua key type: {s}", .{@typeName(T)});
+                return error.InvalidLuaKey;
             },
         }
 
-        std.debug.print(")\n", .{});
+        try self.pushValue(value);
+        lua_settable(self.state, -3);
     }
-}
 
-pub inline fn get_top_typename(L: ?*LuaState) [*c]const u8 {
-    const typ = lua_type(L, -1);
-    const typename = lua_typename(L, @intFromEnum(typ));
+    pub fn pushValue(self: *Lua, value: anytype) !void {
+        // Uses zig comptime to determine what lua function to call to push the zig value.  Pattern
+        // taken from https://github.com/ziglang/zig/blob/56996a2809421a7dfbb74f7533d40faf6c1482e3/lib/std/json/stringify.zig#L493
+        const T = @TypeOf(value);
+        switch (@typeInfo(T)) {
+            .Int, .ComptimeInt => {
+                lua_pushinteger(self.state, value);
+            },
+            .Float, .ComptimeFloat => {
+                lua_pushnumber(self.state, value);
+            },
+            .Pointer => try self.pushPointer(value),
+            else => {
+                std.log.err("TODO(pushValue): handle zig type {s}", .{@typeName(T)});
+                return error.UnhandledZigValue;
+            },
+        }
+    }
 
-    return typename;
-}
+    fn pushPointer(self: *Lua, value: anytype) !void {
+        const T = @TypeOf(value);
+        switch (@typeInfo(T)) {
+            .Pointer => |ptr_info| switch (ptr_info.size) {
+                .One => switch (@typeInfo(ptr_info.child)) {
+                    .Array => {
+                        // Coerce `*[N]T` to `[]const T`.
+                        const Slice = []const std.meta.Elem(ptr_info.child);
+                        return self.pushValue(@as(Slice, value));
+                    },
+                    else => return self.pushValue(value.*),
+                },
+                .Many, .Slice => {
+                    if (ptr_info.child == u8) {
+                        // This is a []const u8, or some similar Zig string.
+                        lua_pushlstring(self.state, value.ptr, value.len);
+                    } else {
+                        std.log.err("TODO(pushValue): handle zig type Pointer of {s}", .{@typeName(ptr_info.child)});
+                        return error.UnhandledZigValue;
+                    }
+                },
+                else => {
+                    std.log.err("TODO(pushValue): handle zig type Pointer of {s}", .{@typeName(ptr_info.child)});
+                    return error.UnhandledZigValue;
+                },
+            },
+            else => {
+                std.log.err("pushPointer called with non-pointer type {s}", .{@typeName(T)});
+                return error.InvalidPointerType;
+            },
+        }
+    }
 
-pub inline fn show_lua_error(L: ?*LuaState, fmt: [*c]const u8, args: anytype) void {
-    _ = @call(std.builtin.CallModifier.auto, luaL_error, .{ L, fmt } ++ args);
-}
+    pub fn pushGlobal(self: *Lua, name: []const u8) void {
+        _ = lua_getglobal(self.state, @ptrCast(name));
+    }
 
-pub fn cStrToOwnedSlice(cstr: [*c]const u8, allocator: std.mem.Allocator) ![]const u8 {
-    const bodyLen = std.mem.len(cstr);
-    const luaBody: []const u8 = cstr[0..bodyLen];
-    const ownedBody = try allocator.alloc(u8, bodyLen);
-    @memcpy(ownedBody, luaBody);
-    return @ptrCast(ownedBody);
-}
+    pub fn callFunction(self: *Lua, nargs: c_int, nreturn: c_int) !void {
+        return lua_pcall(self.state, nargs, nreturn, 0);
+    }
 
-pub fn cStrAsSlice(cstr: [*c]const u8) []const u8 {
-    const len = std.mem.len(cstr);
-    return cstr[0..len];
+    pub fn expectType(self: *Lua, expected: Type) !void {
+        return self.expectTypeAtIndex(expected, -1);
+    }
+
+    pub fn expectTypeAtIndex(self: *Lua, expected: Type, idx: c_int) !void {
+        // translate from my silly pseudo-types to real lua types
+        const realExpected = switch (expected) {
+            .INTEGER => Type.NUMBER,
+            .FLOAT => Type.NUMBER,
+            else => expected,
+        };
+        const actual = lua_type(self.state, idx);
+        const actualStr = lua_typename(self.state, @intFromEnum(actual));
+        const expectedStr = lua_typename(self.state, @intFromEnum(realExpected));
+        if (actual != realExpected) {
+            std.log.err("expectTypeAtIndex({d}): expected {s}, received {s}", .{ idx, expectedStr, actualStr });
+            self.throw_lua_error("expectTypeAtIndex(%d): expected %s, received %s", .{ idx, expectedStr, actualStr });
+            return error.UnexpectedType;
+        }
+    }
+
+    pub fn getField(self: *Lua, field: [:0]const u8) void {
+        _ = lua_getfield(self.state, -1, field);
+    }
+
+    pub fn pushNil(self: *Lua) void {
+        lua_pushnil(self.state);
+    }
+
+    pub fn pop(self: *Lua, n: c_int) void {
+        lua_pop(self.state, n);
+    }
+
+    pub fn next(self: *Lua, n: c_int) bool {
+        return lua_next(self.state, n) != 0;
+    }
+
+    fn castToType(comptime t: Type) type {
+        return switch (t) {
+            .BOOLEAN => bool,
+            .STRING => []const u8,
+            .INTEGER => LuaInteger,
+            .FLOAT => LuaNumber,
+            else => @compileError("unable to cast lua value of type " ++ @tagName(t)),
+        };
+    }
+
+    pub fn readIndex(self: *Lua, comptime t: Type, idx: c_int) !castToType(t) {
+        try self.expectTypeAtIndex(t, idx);
+        return switch (t) {
+            .BOOLEAN => lua_toboolean(self.state, idx),
+            .STRING => std.mem.span(lua_tostring(self.state, idx)),
+            .INTEGER => lua_tointeger(self.state, idx),
+            .FLOAT => lua_tonumber(self.state, idx),
+            else => unreachable,
+        };
+    }
+
+    pub fn readTop(self: *Lua, comptime t: Type) !castToType(t) {
+        return self.readIndex(t, -1);
+    }
+
+    pub fn debugStack(self: *Lua) void {
+        const top = lua_gettop(self.state);
+
+        std.debug.print("-- LUA STACK (top = {d}) --\n", .{top});
+        var i: c_int = 0;
+        while (i <= top) : (i += 1) {
+            const typ = lua_type(self.state, i);
+            std.debug.print("\t{d}: {s} (", .{ i, @tagName(typ) });
+            switch (typ) {
+                Type.NONE => {
+                    std.debug.print("none", .{});
+                },
+                Type.NIL => {
+                    std.debug.print("nil", .{});
+                },
+                Type.BOOLEAN => {
+                    const value = lua_toboolean(self.state, i);
+                    std.debug.print("{?}", .{value});
+                },
+                Type.LIGHTUSERDATA => {
+                    const value = lua_touserdata(self.state, i);
+                    std.debug.print("{*}", .{value});
+                },
+                Type.NUMBER => {
+                    const value = lua_tonumber(self.state, i);
+                    std.debug.print("{?}", .{value});
+                },
+                Type.STRING => {
+                    const value = lua_tostring(self.state, i);
+                    std.debug.print("{s}", .{value});
+                },
+                Type.USERDATA => {
+                    const value = lua_topointer(self.state, i);
+                    std.debug.print("{*}", .{value});
+                },
+                else => {
+                    // TODO: look into how to print tables & functions and stuff
+                    std.debug.print("unprintable type", .{});
+                },
+            }
+
+            std.debug.print(")\n", .{});
+        }
+    }
+
+    pub fn get_top_typename(self: *Self) []const u8 {
+        const typ = lua_type(self.state, -1);
+        const typename = lua_typename(self.state, @intFromEnum(typ));
+
+        return std.mem.span(typename);
+    }
+
+    pub fn throw_lua_error(self: *Self, fmt: [*c]const u8, args: anytype) void {
+        _ = @call(std.builtin.CallModifier.auto, luaL_error, .{ self.state, fmt } ++ args);
+    }
+};
+
+test "using the struct based API" {
+    var state = Lua.init();
+
+    // note: we have to write to stderr because writing to stdout in tests makes the zig test runner
+    // hang forever...see https://github.com/ziglang/zig/issues/15091
+    const code =
+        \\ function eprintln(...)
+        \\   for _, v in ipairs({...}) do
+        \\     io.output(io.stderr):write(tostring(v))
+        \\   end
+        \\
+        \\   io.output(io.stderr):write('\n')
+        \\ end
+        \\
+        \\ function foo(integer, float, str, table, list)
+        \\   eprintln("int arg: ", integer)
+        \\   eprintln("float arg: ", float)
+        \\   eprintln("string arg: ", str)
+        \\
+        \\   for k, v in pairs(table) do
+        \\     eprintln("[table]: key = " .. k .. " val = " .. v)
+        \\   end
+        \\
+        \\   for k, v in ipairs(list) do
+        \\     eprintln("[list]: key = " .. k .. " val = " .. v)
+        \\   end
+        \\
+        \\  return {
+        \\      status = 69,
+        \\      headers = { some_key = "the value" }
+        \\  }
+        \\ end
+    ;
+
+    try state.execBuffer(code, "chunk");
+
+    // get the function
+    state.pushGlobal("foo");
+
+    // push the function arguments
+    try state.pushValue(2);
+    try state.pushValue(2.2);
+    try state.pushValue("string");
+
+    state.openTable();
+    try state.pushTablePair("key", "value");
+    try state.pushTablePair("number", 123);
+
+    state.openTable();
+    try state.pushTablePair(1, "first");
+    try state.pushTablePair(2, 69);
+
+    // call the function
+    try state.callFunction(5, 1);
+
+    // return type parsing
+    try state.expectType(Type.TABLE);
+    state.getField("status");
+    const status = try state.readTop(Type.INTEGER);
+    try expect(status == 69);
+    // pop status:
+    state.pop(1);
+
+    state.getField("headers");
+    try state.expectType(Type.TABLE);
+
+    state.pushNil();
+    while (state.next(-2)) {
+        const key = try state.readIndex(Type.STRING, -2);
+        const value = try state.readIndex(Type.STRING, -1);
+        try std.testing.expectEqualStrings(key, "some_key");
+        try std.testing.expectEqualStrings(value, "the value");
+        state.pop(1);
+    }
+
+    // pop table
+    state.pop(1);
+    // we're totally done, so clear the stack
+    state.clearStack();
 }

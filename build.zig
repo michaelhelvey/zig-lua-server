@@ -22,4 +22,17 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("sqlite3");
 
     b.installArtifact(exe);
+
+    const exe_tests = b.addTest(.{
+        .optimize = optimization,
+        .target = target,
+        .root_source_file = b.path("src/main.zig"),
+    });
+
+    exe_tests.linkSystemLibrary("lua");
+    exe_tests.linkSystemLibrary("sqlite3");
+
+    const run_exe_tests = b.addRunArtifact(exe_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_exe_tests.step);
 }
