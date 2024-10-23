@@ -7,7 +7,7 @@ pub fn build(b: *std.Build) void {
     const optimization = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
-        .name = "zig-lua-server",
+        .name = "zua",
         .optimize = optimization,
         .target = target,
         .root_source_file = b.path("src/main.zig"),

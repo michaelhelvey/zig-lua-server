@@ -1,0 +1,26 @@
+<html>
+    <head>
+        <title>Home</title>
+        <link
+          rel="stylesheet"
+          href="/assets/pico.min.css"
+        >
+    </head>
+    <body>
+        <main class="container">
+            <h1>Create Account</h1>
+            <form action="/api/signup.lua">
+                <label for="username">
+                    <input type="text" placeholder="username" name="username" />
+                </label>
+
+                <label for="password">
+                    <input type="password" placeholder="password" name="password" />
+                </label>
+
+                <input type="submit" value="Submit" />
+            </form>
+            <a href="/signup.html">Login</a>
+        </main>
+    </body>
+</html>

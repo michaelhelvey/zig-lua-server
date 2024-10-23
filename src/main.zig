@@ -124,9 +124,25 @@ fn invokeLua(alloc: std.mem.Allocator, request: *std.http.Server.Request, bodyRe
     return response;
 }
 
-fn handleConn(conn: std.net.Server.Connection) !void {
+fn contentTypeForExtension(extension: []const u8) []const u8 {
+    if (std.mem.eql(u8, extension, ".html")) {
+        return "text/html";
+    } else if (std.mem.eql(u8, extension, ".css")) {
+        return "text/css";
+    } else if (std.mem.eql(u8, extension, ".js")) {
+        return "text/javascript";
+    } else {
+        return "text/plain";
+    }
+}
+
+// TODO: write a URL parser and have the lua thing parse the `url` struct into a lua table, then
+// pass that in as the target
+
+fn handleConn(conn: std.net.Server.Connection, absoluteRootPath: []const u8) !void {
     var read_buffer: [1024]u8 = undefined;
     var httpServer = std.http.Server.init(conn, &read_buffer);
+    const cwd = std.fs.cwd();
 
     while (true) {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -141,18 +157,45 @@ fn handleConn(conn: std.net.Server.Connection) !void {
             },
         };
 
-        // router: look up the path of the request in the file system, and either stream
-        // a file if it's css or something, or invoke the lua function if it's a lua function,
-        // finally returning 404 if we can't find it at all
+        // If it does not exist or we cannot access it, return 404 before trying to read it
+        const resolvedPath = try std.fs.path.join(allocator, &[_][]const u8{ absoluteRootPath, request.head.target });
+        std.debug.print("resolved {s} to {s}\n", .{ request.head.target, resolvedPath });
+        const stat = cwd.statFile(resolvedPath) catch {
+            try request.respond("Not found", .{
+                .status = std.http.Status.not_found,
+            });
+            conn.stream.close();
+            return;
+        };
 
-        const bodyReader = try request.reader();
-        // return generic 500 on error
-        const response = invokeLua(allocator, &request, bodyReader, "./lua/index.lua") catch LuaResponse{};
+        if (stat.kind != std.fs.File.Kind.file) {
+            try request.respond("Not found", .{
+                .status = std.http.Status.not_found,
+            });
+            conn.stream.close();
+            return;
+        }
 
-        try request.respond(response.body, .{
-            .status = response.status,
-            .extra_headers = response.headers.items,
-        });
+        const extension = std.fs.path.extension(resolvedPath);
+        if (std.mem.eql(u8, extension, ".lua")) {
+            const bodyReader = try request.reader();
+            // return generic 500 on lua error
+            const response = invokeLua(allocator, &request, bodyReader, resolvedPath) catch LuaResponse{};
+
+            try request.respond(response.body, .{
+                .status = response.status,
+                .extra_headers = response.headers.items,
+            });
+        } else {
+            const file = try cwd.openFile(resolvedPath, .{ .mode = .read_only });
+            // FIXME: we should be streaming files, this is stupid, but I don't want to figure out
+            // what the respondStreaming() API wants right now
+            const body = try file.reader().readAllAlloc(allocator, MAX_REQUEST_SIZE);
+            const contentType = contentTypeForExtension(extension);
+            try request.respond(body, .{
+                .extra_headers = &[_]std.http.Header{std.http.Header{ .name = "content-type", .value = contentType }},
+            });
+        }
 
         if (!request.head.keep_alive) {
             conn.stream.close();
@@ -162,9 +205,34 @@ fn handleConn(conn: std.net.Server.Connection) !void {
 }
 
 pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var it = std.process.args();
+    var i: usize = 0;
+    var rootPath: ?[]const u8 = null;
+
+    while (it.next()) |arg| {
+        if (i == 1) {
+            rootPath = arg;
+        }
+        i += 1;
+    }
+
+    if (rootPath == null) {
+        return error.NoRootPath;
+    }
+
+    if (!std.fs.path.isAbsolute(rootPath.?)) {
+        rootPath = try std.fs.cwd().realpathAlloc(alloc, rootPath.?);
+    }
+
     const addr = try std.net.Address.resolveIp("127.0.0.1", 8000);
     server = try addr.listen(.{ .reuse_address = true });
     std.log.info("server listening on http://localhost:8000", .{});
+
+    std.log.info("serving root path: {s}", .{rootPath.?});
 
     L = lua.luaL_newstate();
     _ = lua.luaL_openlibs(L);
@@ -173,6 +241,6 @@ pub fn main() !void {
 
     while (true) {
         const conn = try server.accept();
-        _ = try std.Thread.spawn(.{}, handleConn, .{conn});
+        _ = try std.Thread.spawn(.{}, handleConn, .{ conn, rootPath.? });
     }
 }

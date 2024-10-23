@@ -48,7 +48,7 @@ pub fn initTables() void {
         return;
     }
 
-    const createTable = "create table if not exists users (id integer primary key, name text);";
+    const createTable = "create table if not exists users (id integer primary key, name text, username text, password text);";
     if (c.sqlite3_exec(db, createTable, null, null, null) != c.SQLITE_OK) {
         std.debug.print("Failed to create table\n", .{});
         return;

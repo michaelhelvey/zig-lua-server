@@ -1,6 +1,7 @@
-default:
+run:
     zig build -freference-trace=100
-    ./zig-out/bin/zig-lua-server
+    ./zig-out/bin/zua ./lua
 
-play:
-    lua ./lua/playground.lua
+clean:
+    rm -rf ./zig-out
+    rm -rf ./.zig-cache
