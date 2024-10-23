@@ -17,7 +17,61 @@ const LuaResponse = struct {
     body: []const u8 = "Internal server error",
 };
 
-fn invokeLua(alloc: std.mem.Allocator, request: *std.http.Server.Request, bodyReader: std.io.AnyReader, luaSrc: []const u8) !LuaResponse {
+const QueryParam = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+// I'm sure the std lib has this code but I can't find it and I'm tired
+const BufReader = struct {
+    buf: []const u8,
+    cursor: usize,
+
+    const Error = error{NoError};
+    const Self = @This();
+    const Reader = std.io.Reader(*Self, Error, read);
+
+    fn init(buf: []const u8) Self {
+        return .{
+            .buf = buf,
+            .cursor = 0,
+        };
+    }
+
+    fn read(self: *Self, dest: []u8) Error!usize {
+        var i: usize = 0;
+        while (i < dest.len) : (i += 1) {
+            if (self.cursor > self.buf.len - 1) {
+                return 0;
+            }
+            dest[i] = self.buf[self.cursor];
+            self.cursor += 1;
+        }
+
+        return i;
+    }
+
+    fn reader(self: *Self) Reader {
+        return .{ .context = self };
+    }
+};
+
+const Url = struct {
+    path: []const u8,
+    query_params: []QueryParam,
+
+    fn parse(alloc: std.mem.Allocator, raw: []const u8) !Url {
+        _ = alloc;
+        _ = raw;
+        // TODO: add testing target and actually write a query parameter parser
+        return .{
+            .path = "/api/signup.lua",
+            .query_params = &.{},
+        };
+    }
+};
+
+fn invokeLua(alloc: std.mem.Allocator, request: *std.http.Server.Request, bodyReader: std.io.AnyReader, luaSrc: []const u8, url: Url) !LuaResponse {
     var response: LuaResponse = .{};
     try lua.luaL_dofile(L, @ptrCast(luaSrc));
     lua.lua_pop(L, lua.lua_gettop(L));
@@ -31,8 +85,25 @@ fn invokeLua(alloc: std.mem.Allocator, request: *std.http.Server.Request, bodyRe
     lua.lua_pushstring(L, @tagName(request.head.method));
     lua.lua_settable(L, -3);
 
+    // table for url
+    lua.lua_pushstring(L, "url");
+
+    lua.lua_newtable(L);
     lua.lua_pushstring(L, "path");
-    lua.lua_pushlstring(L, request.head.target.ptr, request.head.target.len);
+    lua.lua_pushlstring(L, url.path.ptr, url.path.len);
+    lua.lua_settable(L, -3);
+
+    lua.lua_pushstring(L, "params");
+    lua.lua_newtable(L); // table for params
+    for (url.query_params) |param| {
+        lua.lua_pushlstring(L, param.key.ptr, param.key.len);
+        lua.lua_pushlstring(L, param.value.ptr, param.value.len);
+        lua.lua_settable(L, -3);
+    }
+    // push params onto url
+    lua.lua_settable(L, -3);
+
+    // push url onto parent
     lua.lua_settable(L, -3);
 
     lua.lua_pushstring(L, "headers");
@@ -136,9 +207,6 @@ fn contentTypeForExtension(extension: []const u8) []const u8 {
     }
 }
 
-// TODO: write a URL parser and have the lua thing parse the `url` struct into a lua table, then
-// pass that in as the target
-
 fn handleConn(conn: std.net.Server.Connection, absoluteRootPath: []const u8) !void {
     var read_buffer: [1024]u8 = undefined;
     var httpServer = std.http.Server.init(conn, &read_buffer);
@@ -157,9 +225,11 @@ fn handleConn(conn: std.net.Server.Connection, absoluteRootPath: []const u8) !vo
             },
         };
 
+        const url = try Url.parse(allocator, request.head.target);
+
         // If it does not exist or we cannot access it, return 404 before trying to read it
-        const resolvedPath = try std.fs.path.join(allocator, &[_][]const u8{ absoluteRootPath, request.head.target });
-        std.debug.print("resolved {s} to {s}\n", .{ request.head.target, resolvedPath });
+        const resolvedPath = try std.fs.path.join(allocator, &[_][]const u8{ absoluteRootPath, url.path });
+        std.debug.print("resolved {s} to {s}\n", .{ url.path, resolvedPath });
         const stat = cwd.statFile(resolvedPath) catch {
             try request.respond("Not found", .{
                 .status = std.http.Status.not_found,
@@ -180,7 +250,7 @@ fn handleConn(conn: std.net.Server.Connection, absoluteRootPath: []const u8) !vo
         if (std.mem.eql(u8, extension, ".lua")) {
             const bodyReader = try request.reader();
             // return generic 500 on lua error
-            const response = invokeLua(allocator, &request, bodyReader, resolvedPath) catch LuaResponse{};
+            const response = invokeLua(allocator, &request, bodyReader, resolvedPath, url) catch LuaResponse{};
 
             try request.respond(response.body, .{
                 .status = response.status,
