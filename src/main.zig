@@ -89,8 +89,8 @@ fn invokeLua(alloc: std.mem.Allocator, request: *std.http.Server.Request, bodyRe
     // headers table is now at the top of the stack (-1)
     lua.lua_pushnil(L); // give lua_next something to pop
     while (lua.lua_next(L, -2) != 0) {
-        const key = try lua.cStrToOwned(lua.lua_tostring(L, -2), alloc);
-        const value = try lua.cStrToOwned(lua.lua_tostring(L, -1), alloc);
+        const key = try lua.cStrToOwnedSlice(lua.lua_tostring(L, -2), alloc);
+        const value = try lua.cStrToOwnedSlice(lua.lua_tostring(L, -1), alloc);
         const header = std.http.Header{
             .name = key,
             .value = value,
@@ -113,7 +113,7 @@ fn invokeLua(alloc: std.mem.Allocator, request: *std.http.Server.Request, bodyRe
         return response;
     }
     const responseBody = lua.lua_tostring(L, -1);
-    response.body = try lua.cStrToOwned(responseBody, alloc);
+    response.body = try lua.cStrToOwnedSlice(responseBody, alloc);
 
     // pop body
     lua.lua_pop(L, 1);
@@ -140,6 +140,10 @@ fn handleConn(conn: std.net.Server.Connection) !void {
                 return;
             },
         };
+
+        // router: look up the path of the request in the file system, and either stream
+        // a file if it's css or something, or invoke the lua function if it's a lua function,
+        // finally returning 404 if we can't find it at all
 
         const bodyReader = try request.reader();
         // return generic 500 on error

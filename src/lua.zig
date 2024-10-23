@@ -77,6 +77,8 @@ pub extern fn lua_typename(L: ?*LuaState, type: c_int) [*c]const u8;
 pub extern fn lua_error(L: ?*LuaState) c_int;
 pub extern fn luaL_error(L: ?*LuaState, fmt: [*c]const u8, ...) c_int;
 pub extern fn luaL_setfuncs(L: ?*LuaState, l: [*c]const LuaReg, nup: c_int) void;
+pub extern fn lua_seti(L: ?*LuaState, idx: c_int, n: LuaInteger) void;
+pub extern fn lua_rawseti(L: ?*LuaState, idx: c_int, n: LuaInteger) void;
 pub extern fn luaL_checkversion_(L: ?*LuaState, ver: LuaNumber, sz: usize) void;
 pub extern fn lua_next(L: ?*LuaState, idx: c_int) c_int;
 pub extern fn lua_setglobal(L: ?*LuaState, name: [*c]const u8) void;
@@ -289,10 +291,15 @@ pub inline fn show_lua_error(L: ?*LuaState, fmt: [*c]const u8, args: anytype) vo
     _ = @call(std.builtin.CallModifier.auto, luaL_error, .{ L, fmt } ++ args);
 }
 
-pub fn cStrToOwned(cstr: [*c]const u8, allocator: std.mem.Allocator) ![]const u8 {
+pub fn cStrToOwnedSlice(cstr: [*c]const u8, allocator: std.mem.Allocator) ![]const u8 {
     const bodyLen = std.mem.len(cstr);
     const luaBody: []const u8 = cstr[0..bodyLen];
     const ownedBody = try allocator.alloc(u8, bodyLen);
     @memcpy(ownedBody, luaBody);
     return @ptrCast(ownedBody);
+}
+
+pub fn cStrAsSlice(cstr: [*c]const u8) []const u8 {
+    const len = std.mem.len(cstr);
+    return cstr[0..len];
 }

@@ -1,5 +1,3 @@
-print("I am a lua file that is being invoked")
-
 function handle_request(request)
     print("received request at " .. request["path"])
 
@@ -8,15 +6,15 @@ function handle_request(request)
         print("key = " .. k .. ", val = " .. v)
     end
 
+    users = utils.sqlite3_query("select * from users;");
+
     return {
         status = 200,
         headers = {
             ["content-type"] = "application/json"
         },
         body = utils.json({
-            message = "hi from lua - I can write json now!",
-            nested = { very = { nestedMore = "indeed" } },
-            list = {"some", "list", "of", "stuff", 69},
+            users = users,
         })
     }
 end

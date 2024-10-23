@@ -1,11 +1,7 @@
 // Lua utils lib that we expose to our scripts
 const std = @import("std");
 const lua = @import("lua.zig");
-
-fn cStrAsSlice(cstr: [*c]const u8) []const u8 {
-    const len = std.mem.len(cstr);
-    return cstr[0..len];
-}
+const sql = @import("sql.zig");
 
 fn encodeJsonValue(L: ?*lua.LuaState, writer: anytype) anyerror!void {
     const typ = lua.lua_type(L, -1);
@@ -33,13 +29,13 @@ fn encodeJsonValue(L: ?*lua.LuaState, writer: anytype) anyerror!void {
                     try writer.beginObject();
 
                     // encode the key/value we ar ecurrently at
-                    try writer.objectField(cStrAsSlice(lua.lua_tostring(L, -2)));
+                    try writer.objectField(lua.cStrAsSlice(lua.lua_tostring(L, -2)));
                     try encodeJsonValue(L, writer);
                     lua.lua_pop(L, 1);
 
                     // keep encoding and popping
                     while (lua.lua_next(L, -2) != 0) {
-                        const key = cStrAsSlice(lua.lua_tostring(L, -2));
+                        const key = lua.cStrAsSlice(lua.lua_tostring(L, -2));
                         try writer.objectField(key);
                         try encodeJsonValue(L, writer);
                         lua.lua_pop(L, 1);
@@ -54,7 +50,7 @@ fn encodeJsonValue(L: ?*lua.LuaState, writer: anytype) anyerror!void {
             }
         },
         .STRING => {
-            const key = cStrAsSlice(lua.lua_tostring(L, -1));
+            const key = lua.cStrAsSlice(lua.lua_tostring(L, -1));
             try writer.write(key);
         },
         .NUMBER => {
@@ -95,9 +91,34 @@ fn encodeLuaTableAsJson(L: ?*lua.LuaState) c_int {
     };
 }
 
-const module: [2]lua.LuaReg = .{ lua.LuaReg{ .name = "json", .func = encodeLuaTableAsJson }, lua.LuaReg{ .name = null, .func = null } };
+fn defaultLuaHashFn(L: ?*lua.LuaState) c_int {
+    if (!lua.lua_isstring(L, -1)) {
+        const typ = lua.lua_type(L, -1);
+        const typename = lua.lua_typename(L, @intFromEnum(typ));
+        lua.show_lua_error(L, "expected first argument to hash() to be a string, received %s", .{typename});
+        return 0;
+    }
+
+    const arg1 = lua.cStrAsSlice(lua.lua_tostring(L, -1));
+
+    // TODO: expose salt from lua side
+    const result = std.crypto.pwhash.bcrypt.bcrypt(arg1, "1234abcdzxcv6789".*, .{ .rounds_log = 12 });
+    lua.lua_pop(L, 1); // pop arg
+
+    lua.lua_pushlstring(L, &result, result.len);
+    return 1;
+}
+
+const module: [4]lua.LuaReg = .{
+    lua.LuaReg{ .name = "json", .func = encodeLuaTableAsJson },
+    lua.LuaReg{ .name = "hash", .func = defaultLuaHashFn },
+    lua.LuaReg{ .name = "sqlite3_query", .func = sql.luaQueryDefaultDb },
+    lua.LuaReg{ .name = null, .func = null },
+};
 
 pub fn initTable(L: ?*lua.LuaState) void {
+    sql.initTables();
+
     lua.lua_newtable(L);
     lua.luaL_setfuncs(L, &module, 0);
     lua.lua_setglobal(L, "utils");
