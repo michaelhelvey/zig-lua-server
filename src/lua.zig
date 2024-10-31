@@ -32,7 +32,7 @@ const LuaInteger = u64;
 const LUA_VERSION_NUM = 504;
 const LUAL_NUMSIZES = 16 * @sizeOf(LuaInteger) + @sizeOf(LuaNumber);
 
-const Status = enum(c_int) {
+pub const Status = enum(c_int) {
     OK = 0,
     YIELD = 1,
     ERRUN = 2,
@@ -41,7 +41,7 @@ const Status = enum(c_int) {
     ERRERR = 5,
 };
 
-const Type = enum(c_int) {
+pub const Type = enum(c_int) {
     NONE = -1,
     NIL = 0,
     BOOLEAN = 1,
@@ -282,8 +282,8 @@ pub const Lua = struct {
         lua_pop(self.state, lua_gettop(self.state));
     }
 
-    pub fn execFile(self: *Lua, file: []const u8) !void {
-        luaL_dofile(self.state, file);
+    pub fn execFile(self: *Lua, file: [:0]const u8) !void {
+        try luaL_dofile(self.state, file);
     }
 
     pub fn openTable(self: *Lua) void {
@@ -304,6 +304,10 @@ pub const Lua = struct {
         }
 
         try self.pushValue(value);
+        lua_settable(self.state, -3);
+    }
+
+    pub fn pushTable(self: *Lua) void {
         lua_settable(self.state, -3);
     }
 
@@ -474,7 +478,7 @@ pub const Lua = struct {
         }
     }
 
-    pub fn get_top_typename(self: *Self) []const u8 {
+    pub fn getTopTypename(self: *Self) []const u8 {
         const typ = lua_type(self.state, -1);
         const typename = lua_typename(self.state, @intFromEnum(typ));
 
